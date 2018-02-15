@@ -1,6 +1,6 @@
 language: python
 python:
-- '3.4'
+- '3.5'
 sudo: false
 services:
 - redis-server
@@ -10,7 +10,6 @@ branches:
 install:
 - pip install -U pip
 - pip install cython
-- 'pip install --no-binary :all: falcon'
 - python setup.py develop
 - pip install -r requirements-dev.txt
 - pip install python-coveralls

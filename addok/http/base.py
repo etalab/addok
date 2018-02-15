@@ -1,14 +1,17 @@
-import json
+import asyncio
 import logging
 import logging.handlers
+from http import HTTPStatus
 from pathlib import Path
 
-import falcon
-
+import uvloop
 from addok.config import config
 from addok.core import reverse, search
 from addok.helpers.text import EntityTooLarge
+from roll import HttpError, Query, Response, Roll
+from roll.extensions import cors, simple_server
 
+asyncio.set_event_loop(uvloop.new_event_loop())
 notfound_logger = None
 query_logger = None
 
@@ -22,7 +25,7 @@ def on_load():
         filename = Path(config.LOG_DIR).joinpath('notfound.log')
         try:
             handler = logging.handlers.TimedRotatingFileHandler(
-                                                str(filename), when='midnight')
+                str(filename), when='midnight')
         except FileNotFoundError:
             print('Unable to write to {}'.format(filename))
         else:
@@ -35,7 +38,7 @@ def on_load():
         filename = Path(config.LOG_DIR).joinpath('queries.log')
         try:
             handler = logging.handlers.TimedRotatingFileHandler(
-                                                str(filename), when='midnight')
+                str(filename), when='midnight')
         except FileNotFoundError:
             print('Unable to write to {}'.format(filename))
         else:
@@ -58,116 +61,124 @@ def log_query(query, results):
         query_logger.debug('\t'.join([query, result, score]))
 
 
-class CorsMiddleware:
+class AddokQuery(Query):
 
-    def process_response(self, req, resp, resource):
-        resp.set_header('Access-Control-Allow-Origin', '*')
-        resp.set_header('Access-Control-Allow-Headers', 'X-Requested-With')
+    @property
+    def q(self):
+        if 'q' in self:
+            return self.get('q')
+        else:
+            raise HttpError(HTTPStatus.BAD_REQUEST, 'Missing query')
 
+    @property
+    def limit(self):
+        return self.int('limit', 5)  # Use config.
 
-class View:
+    @property
+    def autocomplete(self):
+        return self.bool('autocomplete', True)
 
-    config = config
+    @property
+    def lon(self):
+        for key in ('lon', 'lng', 'long'):
+            try:
+                return self.float(key)
+            except HttpError:
+                pass
+        return None
 
-    def match_filters(self, req):
+    @property
+    def lat(self):
+        try:
+            return self.float('lat')
+        except HttpError:
+            return None
+
+    @property
+    def filters(self):
         filters = {}
         for name in config.FILTERS:
-            req.get_param(name, store=filters)
+            result = self.get(name, None)
+            if result is not None:
+                filters[name] = result
         return filters
 
-    def to_geojson(self, req, resp, results, query=None, filters=None,
-                   center=None, limit=None):
+
+class AddokResponse(Response):
+
+    def to_geojson(self, results, extras):
         results = {
-            "type": "FeatureCollection",
-            "version": "draft",
-            "features": [r.format() for r in results],
-            "attribution": config.ATTRIBUTION,
-            "licence": config.LICENCE,
+            'type': 'FeatureCollection',
+            'version': 'draft',
+            'features': [r.format() for r in results],
+            'attribution': config.ATTRIBUTION,
+            'licence': config.LICENCE,
         }
-        if query:
-            results['query'] = query
-        if filters:
-            results['filters'] = filters
-        if center:
-            results['center'] = center
-        if limit:
-            results['limit'] = limit
-        self.json(req, resp, results)
-
-    def json(self, req, resp, content):
-        resp.body = json.dumps(content)
-        resp.content_type = 'application/json; charset=utf-8'
-
-    def parse_lon_lat(self, req):
-        try:
-            lat = float(req.get_param('lat'))
-            for key in ('lon', 'lng', 'long'):
-                lon = req.get_param(key)
-                if lon is not None:
-                    lon = float(lon)
-                    break
-        except (ValueError, TypeError):
-            lat = None
-            lon = None
-        return lon, lat
+        results.update(**extras)
+        return results
 
 
-class Search(View):
-
-    def on_get(self, req, resp, **kwargs):
-        query = req.get_param('q')
-        if not query:
-            raise falcon.HTTPBadRequest('Missing query', 'Missing query')
-        limit = req.get_param_as_int('limit') or 5  # use config
-        autocomplete = req.get_param_as_bool('autocomplete')
-        if autocomplete is None:
-            # Default is True.
-            # https://github.com/falconry/falcon/pull/493#discussion_r44376219
-            autocomplete = True
-        lon, lat = self.parse_lon_lat(req)
-        center = None
-        if lon and lat:
-            center = (lon, lat)
-        filters = self.match_filters(req)
-        try:
-            results = search(query, limit=limit, autocomplete=autocomplete,
-                             lat=lat, lon=lon, **filters)
-        except EntityTooLarge as e:
-            raise falcon.HTTPRequestEntityTooLarge(str(e))
-        if not results:
-            log_notfound(query)
-        log_query(query, results)
-        self.to_geojson(req, resp, results, query=query, filters=filters,
-                        center=center, limit=limit)
+class AddokRoll(Roll):
+    Query = AddokQuery
+    Response = AddokResponse
 
 
-class Reverse(View):
-
-    def on_get(self, req, resp, **kwargs):
-        lon, lat = self.parse_lon_lat(req)
-        if lon is None or lat is None:
-            raise falcon.HTTPBadRequest('Invalid args', 'Invalid args')
-        limit = req.get_param_as_int('limit') or 1
-        filters = self.match_filters(req)
-        results = reverse(lat=lat, lon=lon, limit=limit, **filters)
-        self.to_geojson(req, resp, results, filters=filters, limit=limit)
+app = AddokRoll()
+app.config = config
+cors(app, headers=['X-Requested-With'])
 
 
-def register_http_endpoint(api):
-    api.add_route('/search', Search())
-    api.add_route('/reverse', Reverse())
+@app.route('/search')
+@app.route('/search/')
+async def search_view(request, response):
+    needle = request.query.q
+    extras = {
+        'query': needle
+    }
+    limit = request.query.limit
+    if limit:
+        extras['limit'] = limit
+    autocomplete = request.query.autocomplete
+    lon = request.query.lon
+    lat = request.query.lat
+    if lon and lat:
+        extras['center'] = (lon, lat)
+    filters = request.query.filters
+    if filters:
+        extras['filters'] = filters
+    try:
+        results = search(needle, limit=limit, autocomplete=autocomplete,
+                         lat=lat, lon=lon, **filters)
+    except EntityTooLarge as e:
+        raise HttpError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(e))
+    if not results:
+        log_notfound(needle)
+    log_query(needle, results)
+    response.json = response.to_geojson(results, extras)
+
+
+@app.route('/reverse')
+@app.route('/reverse/')
+async def reverse_view(request, response):
+    extras = {}
+    lon = request.query.lon
+    lat = request.query.lat
+    if lon is None or lat is None:
+        raise HttpError(HTTPStatus.BAD_REQUEST, 'Invalid args')
+    limit = request.query.limit
+    if limit:
+        extras['limit'] = limit
+    filters = request.query.filters
+    if filters:
+        extras['filters'] = filters
+    results = reverse(lat=lat, lon=lon, limit=limit, **filters)
+    response.json = response.to_geojson(results, extras)
 
 
 def register_command(subparsers):
     parser = subparsers.add_parser('serve', help='Run debug server')
     parser.set_defaults(func=run)
-    parser.add_argument('--host', default='127.0.0.1',
-                        help='Host to expose the demo serve on')
-    parser.add_argument('--port', default='7878',
-                        help='Port to expose the demo server on')
 
 
 def run(args):
-    # Do not import at load time for preventing config import loop.
-    from .wsgi import simple
-    simple(args)
+    simple_server(app, port=7878)
