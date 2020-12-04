@@ -166,7 +166,7 @@ class Search(BaseHelper):
             self.debug('** %s **', collector.__name__.upper())
             if collector(self):
                 break
-        return list(self.render())
+        return list(self.render(filters.get('type') == "housenumber"))
 
     @property
     def geohash_key(self):
@@ -179,7 +179,7 @@ class Search(BaseHelper):
                 self.debug('Empty geohash key, deleting %s', self._geohash_key)
         return self._geohash_key
 
-    def render(self):
+    def render(self, only_housenumbers=False):
         self.convert()
         self._sorted_bucket = list(self.results.values())
         self._sorted_bucket.sort(key=lambda r: r.score, reverse=True)
@@ -187,6 +187,8 @@ class Search(BaseHelper):
             if result.score < config.MIN_SCORE:
                 self.debug('Score too low (%s), removing `%s`', result.score,
                            result)
+                continue
+            if only_housenumbers and result.type != 'housenumber':
                 continue
             yield result
 
@@ -292,7 +294,7 @@ class Reverse(BaseHelper):
         if not self.keys:
             hashes = self.expand(hashes)
             self.fetch(hashes)
-        return self.convert()
+        return self.convert(filters.get('type') == 'housenumber')
 
     def expand(self, hashes):
         new = []
@@ -317,11 +319,13 @@ class Reverse(BaseHelper):
             keys = DB.smembers(key)
         self.keys.update(keys)
 
-    def convert(self):
+    def convert(self, only_housenumbers=False):
         for _id in self.keys:
             result = Result(_id)
             for processor in config.REVERSE_RESULT_PROCESSORS:
                 processor(self, result)
+            if only_housenumbers and result.type != 'housenumber':
+                continue
             self.results.append(result)
             self.debug(result, result.distance, result.score)
         self.results.sort(key=lambda r: r.score, reverse=True)
